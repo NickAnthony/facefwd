@@ -237,72 +237,62 @@ export async function POST(req: NextRequest) {
     console.log('\n=== STEP 1: Generating Avatar Video with Captions.ai ===');
     console.log('Submitting video generation request...');
     let avatarVideoUrl = '';
-    if (process.env.USE_CAPTIONS_API) {
-      const videoSubmitRes = await axios.post<CaptionsSubmitResponse>(
-        'https://api.captions.ai/api/creator/submit',
-        {
-          script,
-          creatorName,
-          resolution: 'fhd',
+    const videoSubmitRes = await axios.post<CaptionsSubmitResponse>(
+      'https://api.captions.ai/api/creator/submit',
+      {
+        script,
+        creatorName,
+        resolution: 'fhd',
+      },
+      {
+        headers: {
+          'x-api-key': process.env.CAPTIONS_API_KEY,
+          'Content-Type': 'application/json',
         },
-        {
-          headers: {
-            'x-api-key': process.env.CAPTIONS_API_KEY,
-            'Content-Type': 'application/json',
-          },
-        }
-      );
+      }
+    );
 
-      // Poll for the video generation result
-      avatarVideoUrl = await pollCaptionsResult(
-        videoSubmitRes.data.operationId
-      );
-    } else {
-      avatarVideoUrl =
-        'https://storage.googleapis.com/captions-avatar-orc/orc/studio/writer__ugc_variant_result/RdGmgWUIohzYK2YlDlXw/824159dc-a9fd-4e54-90a2-3c1e2ac0b7c6/hd_result.mp4?X-Goog-Algorithm=GOOG4-RSA-SHA256&X-Goog-Credential=cloud-run-captions-server%40captions-f6de9.iam.gserviceaccount.com%2F20250409%2Fauto%2Fstorage%2Fgoog4_request&X-Goog-Date=20250409T011851Z&X-Goog-Expires=604800&X-Goog-SignedHeaders=host&X-Goog-Signature=3569d5f5d2a8f6188345e78a5279644ba4ef2adb99f94b50ca92c33ff0d1a5c3028e69d2fd5cb79f88c5c00ec7d3b89638aec989a26fa3816fd4f380fea8a80978a74e2f2fd49073bb335a9b3b78b1bb3c1f8e41cd81cb0fe8f4df29cae50a9a2da9306265633c19ebddd69bd0d39e928e26472d1254c73ae27b9e077174448df14f4056723d3916fb65bf6659cea36265b3565e80ee714edbedfd19242b3b4e2861da6f9454a7f45243cb6012f429b9454c03fd2fd43438a67c9c6a5b4fa30dca3c9b2715815a0d21baa3c56e51bd2dcd1df86c703c6f18997843752c6e987c0e6f2575c24ed76f3efc8993cbe2bb36d3a567679d8135b620859357dcf6a960';
-    }
+    // Poll for the video generation result
+    avatarVideoUrl = await pollCaptionsResult(videoSubmitRes.data.operationId);
+
     console.log('Avatar video URL:', avatarVideoUrl);
 
     // STEP 2: Remove background using Unscreen
     console.log('\n=== STEP 2: Removing Background with Unscreen ===');
     console.log('Submitting background removal request...');
     let unscreenResultUrl = '';
-    if (process.env.USE_UNSCREEN_API) {
-      const unscreenFormData = new FormData();
-      unscreenFormData.append('video_url', avatarVideoUrl);
-      unscreenFormData.append('format', 'mp4');
-      unscreenFormData.append('background_color', '00FF00');
 
-      const unscreenSubmitRes = await axios
-        .post<UnscreenSubmitResponse>(
-          'https://api.unscreen.com/v1.0/videos',
-          unscreenFormData,
-          {
-            headers: {
-              'X-Api-Key': process.env.UNSCREEN_API_KEY || '',
-              ...unscreenFormData.getHeaders(),
-            },
-          }
-        )
-        .catch((error) => {
-          console.error('Unscreen API Error:', {
-            status: error.response?.status,
-            statusText: error.response?.statusText,
-            data: error.response?.data,
-            headers: error.response?.headers,
-          });
-          throw error;
+    const unscreenFormData = new FormData();
+    unscreenFormData.append('video_url', avatarVideoUrl);
+    unscreenFormData.append('format', 'mp4');
+    unscreenFormData.append('background_color', '00FF00');
+
+    const unscreenSubmitRes = await axios
+      .post<UnscreenSubmitResponse>(
+        'https://api.unscreen.com/v1.0/videos',
+        unscreenFormData,
+        {
+          headers: {
+            'X-Api-Key': process.env.UNSCREEN_API_KEY || '',
+            ...unscreenFormData.getHeaders(),
+          },
+        }
+      )
+      .catch((error) => {
+        console.error('Unscreen API Error:', {
+          status: error.response?.status,
+          statusText: error.response?.statusText,
+          data: error.response?.data,
+          headers: error.response?.headers,
         });
+        throw error;
+      });
 
-      // Poll for the background removal result
-      unscreenResultUrl = await pollUnscreenResult(
-        unscreenSubmitRes.data.data.links.self
-      );
-      console.log('Unscreen result URL:', unscreenResultUrl);
-    } else {
-      unscreenResultUrl =
-        'https://storage.googleapis.com/unscreen/unscreen/uploads/variant_video/e999da73-70a1-4a48-a3d1-0627c976ac13/video.mp4';
-    }
+    // Poll for the background removal result
+    unscreenResultUrl = await pollUnscreenResult(
+      unscreenSubmitRes.data.data.links.self
+    );
+    console.log('Unscreen result URL:', unscreenResultUrl);
 
     // Create temporary directory
     console.log('\n=== STEP 2.1: Processing Results ===');
