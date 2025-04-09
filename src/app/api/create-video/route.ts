@@ -152,9 +152,35 @@ async function downloadBackgroundImage(
 ): Promise<string> {
   const backgroundPath = path.join(tempDir, 'background.jpg');
   console.log('Downloading background image...');
-  await execAsync(`curl -L "${url}" -o "${backgroundPath}"`);
-  console.log('Background image downloaded to:', backgroundPath);
-  return backgroundPath;
+
+  try {
+    // Use axios to download the image with proper error handling
+    const response = await axios({
+      method: 'GET',
+      url: url,
+      responseType: 'arraybuffer',
+      validateStatus: (status) => status === 200,
+    });
+
+    // Write the image data to file
+    await fs.promises.writeFile(backgroundPath, response.data);
+
+    // Verify the file exists and has content
+    const stats = await fs.promises.stat(backgroundPath);
+    if (stats.size === 0) {
+      throw new Error('Downloaded background image is empty');
+    }
+
+    console.log('Background image downloaded to:', backgroundPath);
+    return backgroundPath;
+  } catch (error) {
+    console.error('Failed to download background image:', error);
+    throw new Error(
+      `Failed to download background image: ${
+        error instanceof Error ? error.message : 'Unknown error'
+      }`
+    );
+  }
 }
 
 async function compositeVideoWithBackground(
@@ -163,10 +189,29 @@ async function compositeVideoWithBackground(
   outputPath: string
 ): Promise<void> {
   console.log('Compositing video with background...');
-  // FFmpeg command to overlay the transparent video on top of the background image
-  const command = `ffmpeg -loop 1 -i "${backgroundPath}" -i "${videoPath}" -filter_complex "[0:v]scale=1080:1920:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih)/2[bg];[bg][1:v]overlay=(W-w)/2:(H-h)/2" -c:v libx264 -preset medium -crf 23 -c:a copy -shortest "${outputPath}"`;
-  await execAsync(command);
-  console.log('Composited video created at:', outputPath);
+
+  // FFmpeg command to replace green background with the provided background image
+  const command = `ffmpeg -loop 1 -i "${backgroundPath}" -i "${videoPath}" -filter_complex "[0:v]scale=1080:1920:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih)/2[bg];[1:v]chromakey=0x00FF00:0.1:0.2[video];[bg][video]overlay=(W-w)/2:(H-h)/2:format=auto" -c:v libx264 -preset medium -crf 23 -c:a copy -shortest "${outputPath}"`;
+
+  try {
+    const { stderr } = await execAsync(command, {
+      maxBuffer: 1024 * 1024 * 10, // 10MB buffer
+      timeout: 30000, // 30 second timeout
+    });
+
+    if (stderr) {
+      console.warn('FFmpeg warnings:', stderr);
+    }
+
+    console.log('Composited video created at:', outputPath);
+  } catch (error) {
+    console.error('FFmpeg error:', error);
+    throw new Error(
+      `Failed to composite video: ${
+        error instanceof Error ? error.message : 'Unknown error'
+      }`
+    );
+  }
 }
 
 export async function POST(req: NextRequest) {
@@ -192,7 +237,7 @@ export async function POST(req: NextRequest) {
     console.log('\n=== STEP 1: Generating Avatar Video with Captions.ai ===');
     console.log('Submitting video generation request...');
     let avatarVideoUrl = '';
-    if (process.env.USE_API) {
+    if (process.env.USE_CAPTIONS_API) {
       const videoSubmitRes = await axios.post<CaptionsSubmitResponse>(
         'https://api.captions.ai/api/creator/submit',
         {
@@ -222,22 +267,32 @@ export async function POST(req: NextRequest) {
     console.log('\n=== STEP 2: Removing Background with Unscreen ===');
     console.log('Submitting background removal request...');
     let unscreenResultUrl = '';
-    if (process.env.USE_API) {
+    if (process.env.USE_UNSCREEN_API) {
       const unscreenFormData = new FormData();
       unscreenFormData.append('video_url', avatarVideoUrl);
       unscreenFormData.append('format', 'mp4');
-      unscreenFormData.append('background_color', '000000');
+      unscreenFormData.append('background_color', '00FF00');
 
-      const unscreenSubmitRes = await axios.post<UnscreenSubmitResponse>(
-        'https://api.unscreen.com/v1.0/videos',
-        unscreenFormData,
-        {
-          headers: {
-            'X-Api-Key': process.env.UNSCREEN_API_KEY || '',
-            ...unscreenFormData.getHeaders(),
-          },
-        }
-      );
+      const unscreenSubmitRes = await axios
+        .post<UnscreenSubmitResponse>(
+          'https://api.unscreen.com/v1.0/videos',
+          unscreenFormData,
+          {
+            headers: {
+              'X-Api-Key': process.env.UNSCREEN_API_KEY || '',
+              ...unscreenFormData.getHeaders(),
+            },
+          }
+        )
+        .catch((error) => {
+          console.error('Unscreen API Error:', {
+            status: error.response?.status,
+            statusText: error.response?.statusText,
+            data: error.response?.data,
+            headers: error.response?.headers,
+          });
+          throw error;
+        });
 
       // Poll for the background removal result
       unscreenResultUrl = await pollUnscreenResult(

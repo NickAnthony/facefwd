@@ -3,7 +3,7 @@ import { useState, FormEvent } from 'react';
 export default function VideoCreatorForm() {
   const [script, setScript] = useState<string>('Hello this is nick');
   const [backgroundImageUrl, setBackgroundImageUrl] = useState<string>(
-    'https://www.reddit.com/media?url=https%3A%2F%2Fpreview.redd.it%2F7fnljtfflvse1.jpeg%3Fwidth%3D1080%26crop%3Dsmart%26auto%3Dwebp%26s%3D26206ddaf8866e449c95b6df103a7f7ab3026e5e'
+    'https://picsum.photos/1080/1920'
   );
   const [creatorId, setCreatorId] = useState<string>('twin-1-Nick');
   const [isLoading, setIsLoading] = useState<boolean>(false);
