@@ -1,415 +1,298 @@
-import { NextResponse } from 'next/server';
+import { NextRequest, NextResponse } from 'next/server';
 import axios from 'axios';
-// import { v4 as uuidv4 } from 'uuid'; // uuidv4 is not used in the provided logic
+import FormData from 'form-data';
+import fs from 'fs';
+import path from 'path';
+import { promisify } from 'util';
+import { exec } from 'child_process';
 
-// Note: formidable and fs are not needed in App Router for basic form data handling
-// import formidable, { File } from 'formidable';
-// import fs from 'fs';
+const execAsync = promisify(exec);
 
-// No need for config export in App Router
-// export const config = {
-//   api: {
-//     bodyParser: false,
-//   },
-// };
+// Type definitions for API responses
+interface CaptionsSubmitResponse {
+  operationId: string;
+}
 
-// Define expected response types for better type safety (Optional but recommended)
-// interface CaptionsSubmitResponse { ... }
-// interface CaptionsPollResponse { ... }
-
-// Remove Cutout.pro interfaces
-// interface CutoutSubmitResponse { ... }
-// interface CutoutStatusResponse { ... }
-
-// Add Unscreen Interfaces
-interface UnscreenVideoAttributes {
-  status: 'queued' | 'processing' | 'done' | 'error';
-  progress?: number;
-  error?: { title: string; detail?: string; code?: string };
-  result_url?: string; // URL to the output file (e.g., pro_bundle zip)
-  source_url?: string;
-  file_name?: string;
-  format?: string;
+interface CaptionsPollResponse {
+  state: 'COMPLETE' | 'FAILED' | 'PROCESSING';
+  url?: string;
+  error?: string;
 }
 
 interface UnscreenSubmitResponse {
   data: {
-    type: string;
-    id: string; // Video ID needed for polling
-    attributes: UnscreenVideoAttributes;
-    links: { self: string };
+    links: {
+      self: string;
+    };
   };
 }
 
-interface UnscreenStatusResponseData {
-  type: string;
-  id: string;
-  attributes: UnscreenVideoAttributes;
-  links: { self: string };
-}
-
-interface UnscreenStatusResponse {
-  data: UnscreenStatusResponseData;
+interface UnscreenPollResponse {
+  data: {
+    attributes: {
+      status: 'processing' | 'done';
+      result_url?: string;
+    };
+  };
 }
 
 interface CreatomateResponse {
-  url: string; // Adjust if Creatomate uses polling/IDs
+  url: string;
 }
 
-interface CaptionsEditResponse {
-  video_url: string;
-}
-
-// --- Minimal Interfaces for Error Handling ---
-interface PotentialResponseData {
-  message?: string;
-  error?: string | { title: string; detail?: string; code?: string }; // Allow string or Unscreen error object
-  msg?: string;
-  // Add other potential common fields if known
-}
-
-interface PotentialAxiosError extends Error {
-  isAxiosError: true; // Check for this specific flag
-  response?: {
-    data?: unknown; // Keep data unknown initially
-    status?: number;
-    statusText?: string;
-  };
-  config?: {
-    method?: string;
-    url?: string;
-    headers?: Record<string, string | number | boolean>; // More specific than any
-  };
-  code?: string;
-}
-
-// --- Type Guard for our PotentialAxiosError structure ---
-function isPotentialAxiosError(error: unknown): error is PotentialAxiosError {
-  if (
-    typeof error === 'object' &&
-    error !== null &&
-    'isAxiosError' in error && // Check property existence first
-    error.isAxiosError === true && // Access property directly after check
-    'response' in error &&
-    'config' in error &&
-    'message' in error
-  ) {
-    // Add checks for nested properties if needed for more robustness
-    return true;
-  }
-  return false;
-}
-
-// --- Polling Configuration ---
-const POLLING_INTERVAL_MS = 5000; // Check every 5 seconds
-const POLLING_TIMEOUT_MS = 300000; // Timeout after 5 minutes
-
-// --- Helper for Polling ---
-async function pollUntilDone<ResultType, StatusResponseType>(
-  checkStatusFn: () => Promise<StatusResponseType>,
-  getStatusFromResult: (res: StatusResponseType) => string | undefined,
-  getResultUrlFromResult: (res: StatusResponseType) => ResultType | undefined,
-  getErrorMessageFromResult: (res: StatusResponseType) => string | undefined,
-  successStatus: string = 'done',
-  failureStatusPrefix: string = 'fail' // Handle 'failed', 'failure' etc.
-): Promise<ResultType> {
-  const startTime = Date.now();
-  while (Date.now() - startTime < POLLING_TIMEOUT_MS) {
-    console.log(
-      `Polling... Time elapsed: ${((Date.now() - startTime) / 1000).toFixed(
-        0
-      )}s`
+async function pollCaptionsResult(
+  operationId: string,
+  maxAttempts = 100,
+  interval = 2000
+): Promise<string> {
+  console.log(`Starting Captions.ai polling for operationId: ${operationId}`);
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    console.log(`Captions.ai poll attempt ${attempt + 1}/${maxAttempts}`);
+    const pollRes = await axios.post<CaptionsPollResponse>(
+      'https://api.captions.ai/api/creator/poll',
+      { operationId },
+      {
+        headers: {
+          'x-api-key': process.env.CAPTIONS_API_KEY,
+          'Content-Type': 'application/json',
+        },
+      }
     );
-    try {
-      const response = await checkStatusFn();
-      const status = getStatusFromResult(response);
-      const errorMessage = getErrorMessageFromResult(response);
 
-      console.log(`  Current status: ${status}`);
+    console.log('Captions.ai poll response:', pollRes.data);
 
-      if (status === successStatus) {
-        const resultUrl = getResultUrlFromResult(response);
-        if (resultUrl) {
-          console.log(`Polling successful. Result URL: ${resultUrl}`);
-          return resultUrl;
-        } else {
-          throw new Error(
-            `Polling succeeded (status: ${status}) but no result URL found.`
-          );
-        }
-      } else if (status?.startsWith(failureStatusPrefix)) {
-        throw new Error(
-          `Polling failed with status: ${status}. Error: ${
-            errorMessage || 'Unknown error'
-          }`
-        );
-      }
-      // Continue polling if status is neither success nor failure (e.g., 'running', 'processing')
-    } catch (error) {
-      // Log polling errors but continue polling unless it's a definitive failure status from the API
-      console.error(
-        'Polling attempt failed:',
-        error instanceof Error ? error.message : error
-      );
-      if (
-        error instanceof Error &&
-        error.message.includes('Polling failed with status')
-      ) {
-        throw error; // Re-throw definitive API failure
-      }
+    // Check for completion with URL
+    if (pollRes.data.state === 'COMPLETE' && pollRes.data.url) {
+      console.log('Captions.ai video generation completed!');
+      return pollRes.data.url;
+    } else if (pollRes.data.state === 'FAILED') {
+      console.error('Captions.ai video generation failed:', pollRes.data.error);
+      throw new Error(pollRes.data.error || 'Video generation failed');
     }
 
-    await new Promise((resolve) => setTimeout(resolve, POLLING_INTERVAL_MS));
+    console.log('Waiting before next Captions.ai poll...');
+    // Wait before next poll
+    await new Promise((resolve) => setTimeout(resolve, interval));
   }
-  throw new Error(
-    `Polling timed out after ${POLLING_TIMEOUT_MS / 1000} seconds.`
-  );
+
+  throw new Error('Video generation timed out');
 }
 
-// --- Status Check Functions ---
-
-// Unscreen: Check status of background removal
-async function checkUnscreenStatus(
-  videoId: string
-): Promise<UnscreenStatusResponse> {
-  const statusUrl = `https://api.unscreen.com/v1.0/videos/${videoId}`;
-  console.log(
-    `  Polling Unscreen status for videoId: ${videoId} at ${statusUrl}`
-  );
-  const response = await axios.get<UnscreenStatusResponse>(statusUrl, {
-    headers: { 'X-Api-Key': `${process.env.UNSCREEN_API_KEY}` },
-    validateStatus: (status) => status >= 200 && status < 300,
-  });
-  console.log(
-    `  Unscreen poll response status: ${response.status}, data status:`,
-    response.data?.data?.attributes?.status
-  );
-  return response.data; // Axios throws non-2xx, handled by polling catch
-}
-
-// --- Main API Route Handler ---
-export async function POST(request: Request) {
-  console.log('\n--- Received POST /api/create-video ---');
-  try {
-    const formData = await request.formData();
-    const script = formData.get('script') as string | null;
-    const backgroundImageUrl = formData.get('backgroundImageUrl') as
-      | string
-      | null;
-    const creatorId = formData.get('creatorId') as string | null; // Corresponds to creatorName
-
-    console.log('Input Data:', {
-      script: script?.substring(0, 50) + '...',
-      backgroundImageUrl,
-      creatorId,
+async function pollUnscreenResult(
+  url: string,
+  maxAttempts = 100,
+  interval = 3000
+): Promise<string> {
+  console.log(`Starting Unscreen polling for URL: ${url}`);
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    console.log(`Unscreen poll attempt ${attempt + 1}/${maxAttempts}`);
+    const pollRes = await axios.get<UnscreenPollResponse>(url, {
+      headers: { 'X-Api-Key': process.env.UNSCREEN_API_KEY || '' },
     });
 
-    // Basic validation
-    if (!script || !backgroundImageUrl || !creatorId) {
-      console.error('Validation Failed: Missing required fields.');
+    console.log('Unscreen poll response:', pollRes.data);
+
+    if (
+      pollRes.data.data.attributes.status === 'done' &&
+      pollRes.data.data.attributes.result_url
+    ) {
+      console.log('Unscreen background removal completed!');
+      return pollRes.data.data.attributes.result_url;
+    }
+
+    console.log('Waiting before next Unscreen poll...');
+    // Wait before next poll
+    await new Promise((resolve) => setTimeout(resolve, interval));
+  }
+
+  throw new Error('Background removal timed out');
+}
+
+async function downloadAndExtractUnscreenVideo(url: string): Promise<string> {
+  // Create a unique directory for this request
+  const tempDir = path.join(process.cwd(), 'temp', Date.now().toString());
+  await fs.promises.mkdir(tempDir, { recursive: true });
+
+  // Download the video file using curl
+  const alphaVideoPath = path.join(tempDir, 'alpha.mp4');
+  console.log('Downloading alpha video with curl...');
+  await execAsync(
+    `curl -L -H "X-Api-Key: ${process.env.UNSCREEN_API_KEY}" "${url}" -o "${alphaVideoPath}"`
+  );
+  console.log('Alpha video downloaded to:', alphaVideoPath);
+
+  return alphaVideoPath;
+}
+
+async function processAlphaVideo(
+  alphaPath: string,
+  originalVideoPath: string
+): Promise<string> {
+  const outputPath = alphaPath.replace('alpha.mp4', 'transparent.mp4');
+
+  // FFmpeg command to create a transparent video using the alpha channel
+  // This assumes alpha.mp4 has white for the subject and black for transparency
+  const command = `ffmpeg -i ${originalVideoPath} -i ${alphaPath} -filter_complex "[1:v]format=gray,geq=lum='p(X,Y)':a='if(gt(lum(X,Y),0),255,0)'[mask];[0:v][mask]alphamerge[out]" -map "[out]" -map 0:a -c:v libx264 -preset medium -crf 23 -c:a copy ${outputPath}`;
+
+  try {
+    await execAsync(command);
+    return outputPath;
+  } catch (error) {
+    throw new Error(
+      `FFmpeg processing failed: ${
+        error instanceof Error ? error.message : 'Unknown error'
+      }`
+    );
+  }
+}
+
+async function downloadBackgroundImage(
+  url: string,
+  tempDir: string
+): Promise<string> {
+  const backgroundPath = path.join(tempDir, 'background.jpg');
+  console.log('Downloading background image...');
+  await execAsync(`curl -L "${url}" -o "${backgroundPath}"`);
+  console.log('Background image downloaded to:', backgroundPath);
+  return backgroundPath;
+}
+
+async function compositeVideoWithBackground(
+  videoPath: string,
+  backgroundPath: string,
+  outputPath: string
+): Promise<void> {
+  console.log('Compositing video with background...');
+  // FFmpeg command to overlay the transparent video on top of the background image
+  const command = `ffmpeg -loop 1 -i "${backgroundPath}" -i "${videoPath}" -filter_complex "[0:v]scale=1080:1920:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih)/2[bg];[bg][1:v]overlay=(W-w)/2:(H-h)/2" -c:v libx264 -preset medium -crf 23 -c:a copy -shortest "${outputPath}"`;
+  await execAsync(command);
+  console.log('Composited video created at:', outputPath);
+}
+
+export async function POST(req: NextRequest) {
+  try {
+    const formData = await req.formData();
+
+    const script = formData.get('script') as string;
+    const backgroundImageUrl = formData.get('backgroundImageUrl') as string;
+    const creatorName = formData.get('creatorId') as string;
+
+    console.log('script', script);
+    console.log('backgroundImageUrl', backgroundImageUrl);
+    console.log('creatorName', creatorName);
+
+    if (!script || !backgroundImageUrl || !creatorName) {
       return NextResponse.json(
-        {
-          error:
-            'Missing required fields: script, backgroundImageUrl, creatorId',
-        },
+        { error: 'Missing required fields' },
         { status: 400 }
       );
     }
-    if (
-      !process.env.CAPTIONS_API_KEY ||
-      !process.env.UNSCREEN_API_KEY ||
-      !process.env.CREATOMATE_API_KEY
-    ) {
-      console.error(
-        'Validation Failed: Missing one or more API keys in environment variables.'
-      );
-      return NextResponse.json(
-        { error: 'Server configuration error: API key missing.' },
-        { status: 500 }
-      );
-    }
 
-    // --- STEP 1: Submit to Captions.ai & Poll for Avatar Video ---
-    // Step 1 is currently hardcoded/commented out by user
-    const avatarVideoUrl =
-      'https://storage.googleapis.com/captions-avatar-orc/orc/studio/writer__ugc_result/6E7p6Upm6BxBPnBi91Al/be31642e-961c-41f7-ad90-7ca35710bc1a/result.mp4?X-Goog-Algorithm=GOOG4-RSA-SHA256&X-Goog-Credential=cloud-run-captions-server%40captions-f6de9.iam.gserviceaccount.com%2F20250409%2Fauto%2Fstorage%2Fgoog4_request&X-Goog-Date=20250409T001741Z&X-Goog-Expires=604800&X-Goog-SignedHeaders=host&X-Goog-Signature=36d892cae630576b28d3b37e949ff7bb6bcb7eff9d1f1f66c97a540b60b9902d65d615c615ebc5350413f143b7c31da5656be25aa712c5e9eef26034304033827336b843bfeba874bbc363059ad80ac4895808c3631baccf494ae66201e01e6cd5f4a95baf8ed1228eab3c0c03562ade4f61954cedf3efc15946ce53134f02febc6c53d53bf7a5d36f88018332b64e6aa82b3de9d128cc07f2c66c983076d339309000e2905053fff3bc709652508990140990816ebde2a023bada733aef12edd2f33f37ab5c4b4e5f6d37f68df908abb5859d7be2a443bd985b310e87f56d5fe7a6c0f53701b1d914504e36203ec38b8f30cb81ad95d1f0fdb179f54a748f51';
-    console.log(`Step 1 Complete. Using hardcoded Avatar Video URL.`);
-
-    // --- STEP 2: Submit to Unscreen & Poll for Background Removal Result ---
-    console.log('\n--- Step 2: Submitting to Unscreen... ---');
-
-    // Try sending as application/x-www-form-urlencoded
-    const unscreenSubmitData = new URLSearchParams();
-    unscreenSubmitData.append('video_url', avatarVideoUrl);
-    // Specify format if needed, e.g.:
-    // unscreenSubmitData.append('format', 'webm');
-
-    const unscreenSubmitRes = await axios.post<UnscreenSubmitResponse>(
-      'https://api.unscreen.com/v1.0/videos',
-      unscreenSubmitData.toString(), // Send as URL encoded string
-      {
-        headers: {
-          // Set appropriate content type
-          'Content-Type': 'application/x-www-form-urlencoded',
-          'X-Api-Key': `${process.env.UNSCREEN_API_KEY}`,
+    // STEP 1: Generate Avatar Video from Captions.ai
+    console.log('\n=== STEP 1: Generating Avatar Video with Captions.ai ===');
+    console.log('Submitting video generation request...');
+    let avatarVideoUrl = '';
+    if (process.env.USE_API) {
+      const videoSubmitRes = await axios.post<CaptionsSubmitResponse>(
+        'https://api.captions.ai/api/creator/submit',
+        {
+          script,
+          creatorName,
+          resolution: 'fhd',
         },
-      }
-    );
-
-    const unscreenVideoId = unscreenSubmitRes.data?.data?.id;
-    if (!unscreenVideoId) {
-      throw new Error(
-        'Unscreen submission succeeded but failed to get video ID.'
-      );
-    }
-    console.log(`Unscreen job submitted. Video ID: ${unscreenVideoId}`);
-
-    console.log('Polling Unscreen for background removal status...');
-    const unscreenResultUrl = await pollUntilDone<
-      string,
-      UnscreenStatusResponse
-    >(
-      () => checkUnscreenStatus(unscreenVideoId),
-      (res) => res.data?.attributes?.status, // Get status
-      (res) => res.data?.attributes?.result_url, // Get result url
-      (res) => res.data?.attributes?.error?.title, // Get error title if status is error
-      'done', // Success status
-      'error' // Failure status prefix (matches Unscreen's 'error')
-    );
-    console.log(
-      `Step 2 Complete. Unscreen Result URL received: ${unscreenResultUrl}`
-    );
-    console.warn(
-      '!!! IMPORTANT: Unscreen result URL likely points to a pro_bundle ZIP file. Step 3 (Creatomate) expects a direct video URL and will likely fail without intermediate processing (unzip + ffmpeg) to create a transparent video (e.g., WEBM) from the pro_bundle. !!!'
-    );
-    const transparentVideoUrl = unscreenResultUrl; // Assigning for now, but needs processing
-
-    // --- STEP 3: Composite with background using Creatomate ---
-    console.log('\n--- Step 3: Submitting to Creatomate... ---');
-    // !!! This step will likely FAIL because transparentVideoUrl is a ZIP file URL !!!
-    const composition = await axios.post<CreatomateResponse>(
-      'https://api.creatomate.com/v1/renders',
-      {
-        template: {
-          output_format: 'mp4',
-          dimensions: { width: 1080, height: 1920 },
-          elements: [
-            { type: 'image', src: backgroundImageUrl, position: 'center' },
-            {
-              type: 'video',
-              src: transparentVideoUrl, // <<< THIS IS A ZIP URL FROM UNSCREEN
-              position: 'center',
-              fit: 'contain',
-            },
-          ],
-        },
-      },
-      {
-        headers: { Authorization: `Bearer ${process.env.CREATOMATE_API_KEY}` },
-      }
-    );
-    const renderedVideoUrl = composition.data.url;
-    console.log(
-      `Step 3 Complete (but likely used invalid input). Rendered URL received.`
-    );
-
-    // --- STEP 4: Add captions using Captions.ai (AI Edit API) ---
-    // Note: This might also be async and require polling!
-    console.log('\n--- Step 4: Submitting to Captions.ai AI Edit... ---');
-    const captionRes = await axios.post<CaptionsEditResponse>(
-      'https://api.captions.ai/v1/ai-edit', // Confirm this endpoint and its behavior (sync/async)
-      {
-        video_url: renderedVideoUrl,
-        features: {
-          add_captions: { language: 'en' },
-        },
-      },
-      {
-        // Verify auth method for AI Edit API - might be x-api-key?
-        // Might also need Content-Type: application/json
-        headers: { Authorization: `Bearer ${process.env.CAPTIONS_API_KEY}` },
-      }
-    );
-    // Assuming direct URL return for simplicity. Confirm in docs.
-    const finalVideoUrl = captionRes.data.video_url;
-    console.log(
-      `Step 4 Complete. Final Video URL with captions: ${finalVideoUrl}`
-    );
-
-    console.log(
-      '\n--- Video Creation Pipeline Finished (with potential errors in Step 3) ---'
-    );
-    return NextResponse.json({ finalVideoUrl: finalVideoUrl });
-  } catch (error: unknown) {
-    console.error('\n--- ERROR DURING VIDEO CREATION PIPELINE ---');
-    let errorMessage = 'Video generation failed';
-    let status = 500;
-
-    // Use the custom type guard
-    if (isPotentialAxiosError(error)) {
-      const responseData = error.response?.data;
-      const responseStatus = error.response?.status;
-
-      // Log the responseData stringified to see nested errors
-      let responseDataString = '';
-      try {
-        responseDataString = JSON.stringify(responseData, null, 2); // Pretty print
-      } catch {
-        responseDataString = '[Could not stringify response data]';
-      }
-
-      console.error('Axios Error Details:', {
-        message: error.message,
-        code: error.code,
-        status: responseStatus,
-        // Log the stringified version to see details
-        responseDataString: responseDataString,
-        requestConfig: {
-          // Log relevant config safely
-          method: error.config?.method,
-          url: error.config?.url,
-          headers: '***',
-        },
-      });
-
-      // Extract error message (existing logic)
-      let apiErrorMessage: string | undefined;
-      if (typeof responseData === 'object' && responseData !== null) {
-        const potentialData = responseData as PotentialResponseData;
-        const specificError = potentialData.error;
-        if (
-          typeof specificError === 'object' &&
-          specificError !== null &&
-          'title' in specificError
-        ) {
-          apiErrorMessage = `${specificError.title}${
-            specificError.detail ? ': ' + specificError.detail : ''
-          }`;
-        } else {
-          apiErrorMessage =
-            potentialData.message ||
-            (typeof specificError === 'string' ? specificError : undefined) ||
-            potentialData.msg;
+        {
+          headers: {
+            'x-api-key': process.env.CAPTIONS_API_KEY,
+            'Content-Type': 'application/json',
+          },
         }
-      }
-      errorMessage =
-        apiErrorMessage || error.message || 'An API request failed.';
-      status = responseStatus || 500;
-    } else if (error instanceof Error) {
-      // Handle standard JavaScript errors
-      errorMessage = error.message;
-      console.error(`Standard Error: ${error.name} - ${errorMessage}`);
-      console.error(error.stack); // Log stack trace for debugging
+      );
+
+      // Poll for the video generation result
+      avatarVideoUrl = await pollCaptionsResult(
+        videoSubmitRes.data.operationId
+      );
     } else {
-      // Handle non-Error objects thrown
-      console.error('Unknown Error Structure:', error);
-      errorMessage = 'An unexpected error occurred.';
+      avatarVideoUrl =
+        'https://storage.googleapis.com/captions-avatar-orc/orc/studio/writer__ugc_variant_result/RdGmgWUIohzYK2YlDlXw/824159dc-a9fd-4e54-90a2-3c1e2ac0b7c6/hd_result.mp4?X-Goog-Algorithm=GOOG4-RSA-SHA256&X-Goog-Credential=cloud-run-captions-server%40captions-f6de9.iam.gserviceaccount.com%2F20250409%2Fauto%2Fstorage%2Fgoog4_request&X-Goog-Date=20250409T011851Z&X-Goog-Expires=604800&X-Goog-SignedHeaders=host&X-Goog-Signature=3569d5f5d2a8f6188345e78a5279644ba4ef2adb99f94b50ca92c33ff0d1a5c3028e69d2fd5cb79f88c5c00ec7d3b89638aec989a26fa3816fd4f380fea8a80978a74e2f2fd49073bb335a9b3b78b1bb3c1f8e41cd81cb0fe8f4df29cae50a9a2da9306265633c19ebddd69bd0d39e928e26472d1254c73ae27b9e077174448df14f4056723d3916fb65bf6659cea36265b3565e80ee714edbedfd19242b3b4e2861da6f9454a7f45243cb6012f429b9454c03fd2fd43438a67c9c6a5b4fa30dca3c9b2715815a0d21baa3c56e51bd2dcd1df86c703c6f18997843752c6e987c0e6f2575c24ed76f3efc8993cbe2bb36d3a567679d8135b620859357dcf6a960';
+    }
+    console.log('Avatar video URL:', avatarVideoUrl);
+
+    // STEP 2: Remove background using Unscreen
+    console.log('\n=== STEP 2: Removing Background with Unscreen ===');
+    console.log('Submitting background removal request...');
+    let unscreenResultUrl = '';
+    if (process.env.USE_API) {
+      const unscreenFormData = new FormData();
+      unscreenFormData.append('video_url', avatarVideoUrl);
+      unscreenFormData.append('format', 'mp4');
+      unscreenFormData.append('background_color', '000000');
+
+      const unscreenSubmitRes = await axios.post<UnscreenSubmitResponse>(
+        'https://api.unscreen.com/v1.0/videos',
+        unscreenFormData,
+        {
+          headers: {
+            'X-Api-Key': process.env.UNSCREEN_API_KEY || '',
+            ...unscreenFormData.getHeaders(),
+          },
+        }
+      );
+
+      // Poll for the background removal result
+      unscreenResultUrl = await pollUnscreenResult(
+        unscreenSubmitRes.data.data.links.self
+      );
+      console.log('Unscreen result URL:', unscreenResultUrl);
+    } else {
+      unscreenResultUrl =
+        'https://storage.googleapis.com/unscreen/unscreen/uploads/variant_video/90adf86e-98fc-40fe-a4b7-61bab805f3b0/video.mp4';
     }
 
-    // Return a standardized error response
-    console.error(
-      `Pipeline failed. Returning status ${status} with message: "${errorMessage}"`
+    // Create temporary directory
+    console.log('\n=== STEP 2.1: Processing Results ===');
+    console.log('Creating temporary directory...');
+    const tempDir = path.join(process.cwd(), 'temp', Date.now().toString());
+    await fs.promises.mkdir(tempDir, { recursive: true });
+
+    // Download the transparent video from Unscreen
+    console.log('Downloading transparent video...');
+    const transparentVideoPath = path.join(tempDir, 'transparent.mp4');
+    await execAsync(
+      `curl -L -H "X-Api-Key: ${process.env.UNSCREEN_API_KEY}" "${unscreenResultUrl}" -o "${transparentVideoPath}"`
     );
-    return NextResponse.json({ error: errorMessage }, { status: status });
+
+    // Download the background image
+    console.log('\n=== STEP 2.2: Downloading Background Image ===');
+    const backgroundPath = await downloadBackgroundImage(
+      backgroundImageUrl,
+      tempDir
+    );
+
+    // Composite the video with the background
+    console.log('\n=== STEP 2.3: Compositing Video with Background ===');
+    const finalVideoPath = path.join(tempDir, 'final.mp4');
+    await compositeVideoWithBackground(
+      transparentVideoPath,
+      backgroundPath,
+      finalVideoPath
+    );
+
+    // Upload the final video to a storage service or return the local path
+    // For now, we'll return the local path
+    console.log('\n=== PROCESS COMPLETE ===');
+    console.log('Final video created at:', finalVideoPath);
+
+    return NextResponse.json({ finalVideoPath });
+  } catch (error) {
+    console.error('\n=== PROCESS FAILED ===');
+    console.error('Video generation failed:', error);
+    return NextResponse.json(
+      {
+        error:
+          error instanceof Error ? error.message : 'Video generation failed',
+      },
+      { status: 500 }
+    );
   }
 }
